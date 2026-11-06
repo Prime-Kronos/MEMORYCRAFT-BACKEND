@@ -186,9 +186,9 @@ class RoomStart(BaseModel):
 
 class ScoreBody(BaseModel):
     score: int = Field(ge=0, le=100000)
-    round: int = Field(ge=1, le=20)
+    round: int = Field(ge=1, le=35)
     mode: str = Field(pattern="^(global|friends)$")
-    difficulty: str = Field(pattern="^(normal|medium|extreme)$")
+    difficulty: str = Field(pattern="^(normal|medium|hardcore|extreme)$")
     room_code: str | None = Field(default=None, max_length=6)
 
 class ConnectionManager:
@@ -246,22 +246,26 @@ def auth_guest():
     return issue_user(uid, "Guest-" + uid[-5:])
 
 @app.get("/api/leaderboard")
-def leaderboard(limit: int = 100):
+def leaderboard(limit: int = 100, difficulty: str | None = None):
     limit = max(1, min(limit, 100))
+    allowed = {"normal", "medium", "hardcore", "extreme"}
+    if difficulty is not None and difficulty not in allowed:
+        raise HTTPException(status_code=400, detail="Неизвестный уровень сложности.")
     with db() as con:
         rows = con.execute("""
-            SELECT u.name, MAX(s.score) AS score, MAX(s.round_reached) AS round_reached
+            SELECT u.name, s.difficulty, MAX(s.score) AS score,
+                   MAX(s.round_reached) AS round_reached
             FROM scores s JOIN users u ON u.uid=s.uid
-            WHERE s.mode='global'
-            GROUP BY s.uid,u.name
+            WHERE s.mode='global' AND (? IS NULL OR s.difficulty=?)
+            GROUP BY s.uid,u.name,s.difficulty
             ORDER BY score DESC, round_reached DESC, u.name ASC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """, (difficulty, difficulty, limit)).fetchall()
     return {"items": [dict(r) for r in rows]}
 
 @app.post("/api/rooms")
 async def create_room(body: RoomCreate, user=Depends(current_user)):
-    difficulty = body.difficulty if body.difficulty in {"normal", "medium", "extreme"} else "normal"
+    difficulty = body.difficulty if body.difficulty in {"normal", "medium", "hardcore", "extreme"} else "normal"
     for _ in range(10):
         code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))
         try:
@@ -301,7 +305,7 @@ async def join_room(code: str, user=Depends(current_user)):
 @app.post("/api/rooms/{code}/start")
 async def start_room(code: str, body: RoomStart, user=Depends(current_user)):
     code = code.upper()
-    difficulty = body.difficulty if body.difficulty in {"normal", "medium", "extreme"} else "normal"
+    difficulty = body.difficulty if body.difficulty in {"normal", "medium", "hardcore", "extreme"} else "normal"
     with db() as con:
         room = con.execute("SELECT * FROM rooms WHERE code=?", (code,)).fetchone()
         if not room:
