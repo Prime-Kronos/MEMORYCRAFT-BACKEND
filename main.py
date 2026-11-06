@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -27,6 +28,17 @@ WEB_ORIGINS = [
 ]
 TOKEN_TTL = 60 * 60 * 24 * 14
 ROOM_LIMIT = 12
+TASHKENT_TZ = timezone(timedelta(hours=5))
+
+
+def current_week_window():
+    """Weekly leaderboard window: Sunday 00:00 to next Sunday 00:00, Tashkent time."""
+    now = datetime.now(TASHKENT_TZ)
+    days_since_sunday = (now.weekday() + 1) % 7
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
+    start_ts = int(start.timestamp())
+    reset_ts = start_ts + 7 * 24 * 60 * 60
+    return start_ts, reset_ts
 
 app = FastAPI(title="ELVARQ MemoryCraft API", version="1.0.0")
 app.add_middleware(
@@ -251,17 +263,23 @@ def leaderboard(limit: int = 100, difficulty: str | None = None):
     allowed = {"normal", "medium", "hardcore", "extreme"}
     if difficulty is not None and difficulty not in allowed:
         raise HTTPException(status_code=400, detail="Неизвестный уровень сложности.")
+    week_start, reset_at = current_week_window()
     with db() as con:
         rows = con.execute("""
             SELECT u.name, s.difficulty, MAX(s.score) AS score,
                    MAX(s.round_reached) AS round_reached
             FROM scores s JOIN users u ON u.uid=s.uid
-            WHERE s.mode='global' AND (? IS NULL OR s.difficulty=?)
+            WHERE s.mode='global' AND s.created_at>=?
+              AND (? IS NULL OR s.difficulty=?)
             GROUP BY s.uid,u.name,s.difficulty
             ORDER BY score DESC, round_reached DESC, u.name ASC
             LIMIT ?
-        """, (difficulty, difficulty, limit)).fetchall()
-    return {"items": [dict(r) for r in rows]}
+        """, (week_start, difficulty, difficulty, limit)).fetchall()
+    return {
+        "items": [dict(r) for r in rows],
+        "period": "weekly",
+        "reset_at": datetime.fromtimestamp(reset_at, TASHKENT_TZ).isoformat()
+    }
 
 @app.post("/api/rooms")
 async def create_room(body: RoomCreate, user=Depends(current_user)):
