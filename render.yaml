@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: elvarq-memorycraft-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEB_ORIGINS
+        value: https://prime-kronos.github.io
