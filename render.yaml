@@ -8,5 +8,7 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: TOKEN_SECRET
+        sync: false
       - key: WEB_ORIGINS
         value: https://prime-kronos.github.io
