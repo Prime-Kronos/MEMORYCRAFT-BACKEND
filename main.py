@@ -64,11 +64,15 @@ def db():
         with psycopg.connect(DATABASE_URL, row_factory=dict_row) as con:
             yield PostgresCompat(con)
     else:
-        with sqlite3.connect(DB_PATH, timeout=20) as con:
+        con = sqlite3.connect(DB_PATH, timeout=20)
+        try:
             con.row_factory = sqlite3.Row
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("PRAGMA journal_mode=WAL")
             yield con
+            con.commit()
+        finally:
+            con.close()
 
 
 def current_week_window():
