@@ -6,6 +6,15 @@ import os
 import secrets
 import sqlite3
 import time
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    from psycopg.errors import UniqueViolation
+except ImportError:
+    psycopg = None
+    dict_row = None
+    UniqueViolation = None
 import uuid
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -17,7 +26,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(APP_DIR / "memorycraft.sqlite3")))
+DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,) + ((UniqueViolation,) if UniqueViolation else ())
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TOKEN_SECRET = os.getenv("TOKEN_SECRET", "").strip() or (BOT_TOKEN or secrets.token_urlsafe(48))
 WEB_ORIGINS = [
@@ -31,14 +42,60 @@ ROOM_LIMIT = 12
 TASHKENT_TZ = timezone(timedelta(hours=5))
 
 
+class PostgresCompat:
+    """Small adapter so the existing parameterized SQL can run on SQLite or PostgreSQL."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql, params=()):
+        return self.connection.execute(sql.replace("?", "%s"), params)
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+
+@contextmanager
+def db():
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL задан, но psycopg не установлен.")
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as con:
+            yield PostgresCompat(con)
+    else:
+        with sqlite3.connect(DB_PATH, timeout=20) as con:
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("PRAGMA journal_mode=WAL")
+            yield con
+
+
 def current_week_window():
-    """Weekly leaderboard window: Sunday 00:00 to next Sunday 00:00, Tashkent time."""
-    now = datetime.now(TASHKENT_TZ)
-    days_since_sunday = (now.weekday() + 1) % 7
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
-    start_ts = int(start.timestamp())
-    reset_ts = start_ts + 7 * 24 * 60 * 60
-    return start_ts, reset_ts
+    """A rolling 7-day leaderboard period anchored once in the database."""
+    now = int(time.time())
+    with db() as con:
+        row = con.execute(
+            "SELECT period_start FROM leaderboard_periods WHERE id=1"
+        ).fetchone()
+        if not row:
+            con.execute(
+                "INSERT INTO leaderboard_periods(id, period_start) VALUES(1, ?) ON CONFLICT(id) DO NOTHING",
+                (now,)
+            )
+            row = con.execute(
+                "SELECT period_start FROM leaderboard_periods WHERE id=1"
+            ).fetchone()
+        start_ts = int(row["period_start"])
+        week_seconds = 7 * 24 * 60 * 60
+        if now >= start_ts + week_seconds:
+            periods_elapsed = (now - start_ts) // week_seconds
+            start_ts += periods_elapsed * week_seconds
+            con.execute(
+                "UPDATE leaderboard_periods SET period_start=? WHERE id=1",
+                (start_ts,)
+            )
+        return start_ts, start_ts + week_seconds
 
 app = FastAPI(title="ELVARQ MemoryCraft API", version="1.0.0")
 app.add_middleware(
@@ -62,26 +119,28 @@ def db():
         con.close()
 
 def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not DATABASE_URL:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db() as con:
-        con.executescript("""
+        score_id = "BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        con.executescript(f"""
         CREATE TABLE IF NOT EXISTS users (
             uid TEXT PRIMARY KEY,
             telegram_id TEXT UNIQUE,
             name TEXT NOT NULL,
             username TEXT NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL,
-            last_seen INTEGER NOT NULL
+            created_at BIGINT NOT NULL,
+            last_seen BIGINT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS scores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {score_id},
             uid TEXT NOT NULL REFERENCES users(uid),
             score INTEGER NOT NULL,
             round_reached INTEGER NOT NULL,
             mode TEXT NOT NULL,
             difficulty TEXT NOT NULL,
             room_code TEXT,
-            created_at INTEGER NOT NULL
+            created_at BIGINT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_scores_global
             ON scores(mode, score DESC, created_at ASC);
@@ -90,17 +149,24 @@ def init_db():
             owner_uid TEXT NOT NULL REFERENCES users(uid),
             difficulty TEXT NOT NULL DEFAULT 'normal',
             status TEXT NOT NULL DEFAULT 'lobby',
-            created_at INTEGER NOT NULL,
-            started_at INTEGER
+            created_at BIGINT NOT NULL,
+            started_at BIGINT
         );
         CREATE TABLE IF NOT EXISTS room_members (
             room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
             uid TEXT NOT NULL REFERENCES users(uid),
-            joined_at INTEGER NOT NULL,
+            joined_at BIGINT NOT NULL,
             PRIMARY KEY(room_code, uid)
         );
+        CREATE TABLE IF NOT EXISTS leaderboard_periods (
+            id SMALLINT PRIMARY KEY,
+            period_start BIGINT NOT NULL
+        );
         """)
-        con.commit()
+        con.execute(
+            "INSERT INTO leaderboard_periods(id, period_start) VALUES(1, ?) ON CONFLICT(id) DO NOTHING",
+            (int(time.time()),)
+        )
 
 @app.on_event("startup")
 def startup():
@@ -297,7 +363,7 @@ async def create_room(body: RoomCreate, user=Depends(current_user)):
             room, players = get_room(code)
             await broadcast_room(code, "room_state")
             return {"code": code, "members": len(players), "difficulty": difficulty, "status": "lobby", "is_owner": True}
-        except sqlite3.IntegrityError:
+        except DB_INTEGRITY_ERRORS:
             continue
     raise HTTPException(status_code=503, detail="Не удалось создать код комнаты. Попробуй снова.")
 
@@ -314,7 +380,7 @@ async def join_room(code: str, user=Depends(current_user)):
         exists = con.execute("SELECT 1 FROM room_members WHERE room_code=? AND uid=?", (code, user["uid"])).fetchone()
         if not exists and count >= ROOM_LIMIT:
             raise HTTPException(status_code=409, detail=f"В комнате максимум {ROOM_LIMIT} игроков.")
-        con.execute("INSERT OR IGNORE INTO room_members(room_code,uid,joined_at) VALUES(?,?,?)",
+        con.execute("INSERT INTO room_members(room_code,uid,joined_at) VALUES(?,?,?) ON CONFLICT(room_code,uid) DO NOTHING",
                     (code, user["uid"], int(time.time())))
     room, players = get_room(code)
     await broadcast_room(code, "room_state")
