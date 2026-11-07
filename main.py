@@ -328,7 +328,7 @@ def leaderboard(limit: int = 100, difficulty: str | None = None):
                    MAX(s.round_reached) AS round_reached
             FROM scores s JOIN users u ON u.uid=s.uid
             WHERE s.mode='global' AND s.created_at>=?
-              AND (? IS NULL OR s.difficulty=?)
+              AND (CAST(? AS TEXT) IS NULL OR s.difficulty=?)
             GROUP BY s.uid,u.name,s.difficulty
             ORDER BY score DESC, round_reached DESC, u.name ASC
             LIMIT ?
