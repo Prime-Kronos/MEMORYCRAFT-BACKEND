@@ -10,5 +10,7 @@ services:
         sync: false
       - key: TOKEN_SECRET
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: WEB_ORIGINS
         value: https://prime-kronos.github.io
