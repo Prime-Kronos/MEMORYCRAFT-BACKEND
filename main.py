@@ -110,18 +110,6 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-@contextmanager
-def db():
-    con = sqlite3.connect(DB_PATH, timeout=20)
-    con.row_factory = sqlite3.Row
-    try:
-        con.execute("PRAGMA foreign_keys=ON")
-        con.execute("PRAGMA journal_mode=WAL")
-        yield con
-        con.commit()
-    finally:
-        con.close()
-
 def init_db():
     if not DATABASE_URL:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -380,7 +368,8 @@ async def join_room(code: str, user=Depends(current_user)):
             raise HTTPException(status_code=404, detail="Комната не найдена.")
         if room["status"] != "lobby":
             raise HTTPException(status_code=409, detail="Игра в этой комнате уже началась.")
-        count = con.execute("SELECT COUNT(*) FROM room_members WHERE room_code=?", (code,)).fetchone()[0]
+        count_row = con.execute("SELECT COUNT(*) AS member_count FROM room_members WHERE room_code=?", (code,)).fetchone()
+        count = int(count_row["member_count"])
         exists = con.execute("SELECT 1 FROM room_members WHERE room_code=? AND uid=?", (code, user["uid"])).fetchone()
         if not exists and count >= ROOM_LIMIT:
             raise HTTPException(status_code=409, detail=f"В комнате максимум {ROOM_LIMIT} игроков.")
